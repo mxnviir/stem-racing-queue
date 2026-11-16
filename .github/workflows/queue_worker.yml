@@ -1,16 +1,17 @@
 name: queue worker
 # STEM Racing job queue (http://139.185.60.30:8090). Pick now on the panel puts this one file in
-# your repo and starts it. Each matrix job asks the queue for ONE job when it starts: a car
-# (build + airflow test: half car, 4 cores, hierarchical split, 1000 iterations) or a code-test
-# shard. The code and reference files come from the queue server (checked by SHA-256), never
-# from another GitHub repo. An empty queue ends the job in seconds. A solve that would pass
-# GitHub's 6 h limit saves itself and goes back to the queue to continue. No secrets: each job
-# proves its account, run and workflow file with GitHub's signed OIDC token.
+# your repo and starts it. Each slot takes a job from the queue, runs it, reports it, and takes
+# the next one, until the queue is empty or the slot has worked 3 hours (GitHub stops a job at 6 h).
+# A job is a car (build + airflow test: half car, 4 cores, hierarchical split, 1000 iterations),
+# a code-test shard or a lab script. The code and reference files come from the queue server
+# (checked by SHA-256), never from another GitHub repo. A solve that would pass the 6 h limit
+# saves itself and goes back to the queue to continue. No secrets: every request proves its
+# account, run and workflow file with GitHub's signed OIDC token.
 on:
   workflow_dispatch:
     inputs:
-      slots: { description: "Jobs in this run (max 256)", default: "256" }
-      parallel: { description: "Jobs at once (20 free, 40 Pro)", default: "20" }
+      slots: { description: "Slots in this run (max 256)", default: "256" }
+      parallel: { description: "Slots at once (20 free, 40 Pro)", default: "20" }
 permissions: { contents: write, id-token: write }   # release files for long runs; signed identity
 env:
   QUEUE: http://139.185.60.30:8090
@@ -18,6 +19,7 @@ env:
   PY_DEPS: numpy==2.4.6 scipy==1.17.1 pandas trimesh==5.2.0 scikit-image shapely rtree==1.4.1 mapbox-earcut manifold3d==3.5.4 fast_simplification==0.2.0 jax jaxlib matplotlib pymeshlab==2025.7.post1 pytest
   OMPI_MCA_hwloc_base_use_hwthreads_as_cpus: "1"
   OMPI_MCA_rmaps_base_oversubscribe: "1"
+  LOOP_MINUTES: "180"          # take another job only while the slot has worked less than this
 jobs:
   plan:
     runs-on: ubuntu-24.04
@@ -36,164 +38,182 @@ jobs:
       max-parallel: ${{ fromJSON(inputs.parallel) }}
       matrix: { slot: "${{ fromJSON(needs.plan.outputs.slots) }}" }
     steps:
-      - id: claim
+      - name: Write the worker
         run: |
-          echo "P2_JOB_DEADLINE=$(( $(date +%s) + 340*60 ))" >> "$GITHUB_ENV"
-          ID=$(curl -s -m 30 --retry 5 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=stem-queue" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
-          code=$(curl -s -m 60 --retry 5 --retry-all-errors -o job.json -w '%{http_code}' -X POST "$QUEUE/claim" \
-                 -H "Authorization: Bearer $ID" -d '{"slot": ${{ matrix.slot }}}')
-          echo "queue answered HTTP $code"; cat job.json; echo
-          if [ "$code" = 200 ]; then echo "go=1" >> "$GITHUB_OUTPUT"
-          elif [ "$code" = 204 ]; then echo "go=0" >> "$GITHUB_OUTPUT"; echo "No job waiting for this slot."
-          else echo "::error::The queue refused this job (HTTP $code): $(cat job.json)"; exit 1; fi
-      - if: steps.claim.outputs.go == '1'
-        name: Code and files from the queue server (SHA-256 checked)
-        run: |
-          python3 - <<'PY'
-          import hashlib, json, os, subprocess, urllib.request
-          r = json.load(open("job.json"))["recipe"]
-          q = os.environ["QUEUE"]
-          def identity():      # GitHub-signed proof of this run; the queue server only serves files to it
+          echo "SLOT_START=$(date +%s)" >> "$GITHUB_ENV"
+          cat > worker.py <<'PY'
+          """One queue slot: claim -> fetch -> run -> report, repeated (see the header of queue_worker.yml)."""
+          import glob, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.request
+          Q = os.environ["QUEUE"]
+          WS = os.environ["GITHUB_WORKSPACE"]
+
+
+          def identity():
               t = urllib.request.Request(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=stem-queue",
                                          headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
               return json.loads(urllib.request.urlopen(t, timeout=30).read())["value"]
-          need = [{"url": f"{q}/code/{r['ref']}.tar.gz", "sha256": r["code_sha256"], "to": "code"}]
-          need += list(r.get("fetch", []))
-          if r.get("resume_url"):
-              need.append({"url": r["resume_url"], "to": "/tmp/case"})
-          for f in need:
-              url = f["url"] if "://" in f["url"] else q + f["url"]          # "/files/x" = from the queue server
-              p = "/tmp/dl_" + hashlib.sha1(url.encode()).hexdigest()
+
+
+          def claim(slot):
+              """-> job dict, None (queue empty), or stops the slot on a refusal."""
               for t in range(5):
                   try:
-                      hd = {"Authorization": "Bearer " + identity()} if url.startswith(q) else {}
-                      with urllib.request.urlopen(urllib.request.Request(url, headers=hd), timeout=600) as resp, open(p, "wb") as out:
-                          for chunk in iter(lambda: resp.read(1 << 20), b""):
+                      rq = urllib.request.Request(Q + "/claim", json.dumps({"slot": slot}).encode(), method="POST",
+                                                  headers={"Authorization": "Bearer " + identity()})
+                      with urllib.request.urlopen(rq, timeout=60) as r:
+                          return None if r.status == 204 else json.loads(r.read())
+                  except urllib.error.HTTPError as e:
+                      raise SystemExit(f"::error::The queue refused this slot (HTTP {e.code}): {e.read()[:300]!r}")
+                  except Exception as e:
+                      print("retry claim", e)
+                      time.sleep(10)
+              raise SystemExit("::error::could not reach the queue")
+
+
+          def fetch(url, sha, to):
+              url = url if "://" in url else Q + url
+              p = os.path.join(__import__("tempfile").gettempdir(), "dl_" + hashlib.sha1(url.encode()).hexdigest())
+              for t in range(5):
+                  try:
+                      hd = {"Authorization": "Bearer " + identity()} if url.startswith(Q) else {}
+                      with urllib.request.urlopen(urllib.request.Request(url, headers=hd), timeout=600) as r, open(p, "wb") as out:
+                          for chunk in iter(lambda: r.read(1 << 20), b""):
                               out.write(chunk)
                       break
                   except Exception as e:
                       print("retry", url, e)
+                      time.sleep(10)
               h = hashlib.sha256()
               with open(p, "rb") as fh:
                   for chunk in iter(lambda: fh.read(1 << 20), b""):
                       h.update(chunk)
-              if f.get("sha256"):
-                  assert h.hexdigest().startswith(f["sha256"]), f"sha256 mismatch for {url}: {h.hexdigest()}"
-              os.makedirs(f["to"], exist_ok=True)
-              subprocess.run(["unzip", "-q", p, "-d", f["to"]] if url.endswith(".zip") else ["tar", "-xf", p, "-C", f["to"]], check=True)
+              if sha and not h.hexdigest().startswith(sha):
+                  raise RuntimeError(f"sha256 mismatch for {url}: {h.hexdigest()}")
+              os.makedirs(to, exist_ok=True)
+              subprocess.run(["unzip", "-q", "-o", p, "-d", to] if url.endswith(".zip") else ["tar", "-xf", p, "-C", to], check=True)
               os.remove(p)
-              print("fetched", url, "->", f["to"], h.hexdigest()[:16])
+              print("fetched", url, "->", to, h.hexdigest()[:16])
+
+
+          def release_file(path, name):
+              """A big file as a public release asset of this repo -> its URL."""
+              repo = os.environ["GITHUB_REPOSITORY"]
+              subprocess.run(["gh", "release", "create", "queue-files", "-R", repo, "--title", "Queue files",
+                              "--notes", "Saved CFD cases and checkpoints from the job queue."], capture_output=True)
+              os.rename(path, name)
+              subprocess.run(["gh", "release", "upload", "queue-files", name, "--clobber", "-R", repo], check=True)
+              return f"https://github.com/{repo}/releases/download/queue-files/{name}"
+
+
+          def run_one(job):
+              r, jid = job["recipe"], job["id"]
+              for d in ("code", "out", "/tmp/case", "/tmp/refmesh", "/tmp/base"):
+                  shutil.rmtree(d, ignore_errors=True)
+              if os.path.exists("ckpt_path.txt"):
+                  os.remove("ckpt_path.txt")
+              os.makedirs("out/r", exist_ok=True)
+              out = {"id": jid, "ok": False,
+                     "run": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+                     "cpu": subprocess.getoutput("lscpu | grep 'Model name' | sed 's/.*: *//'")}
+              t0 = time.time()
+              env = dict(os.environ, P2_CHECKPOINT_FILE=f"{WS}/ckpt_path.txt", P2_FORCE_OUT=f"{WS}/out/r/forces",
+                         P2_JOB_DEADLINE=str(int(os.environ["SLOT_START"]) + 340 * 60))
+              env.pop("P2_RESUME_CASE", None)
+              if not r.get("resume_url"):        # test-only settings, first link only (e.g. force a save-and-continue)
+                  for k, v in (r.get("env") or {}).items():
+                      if k in ("P2_SOLVE_BUDGET_S",):
+                          env[k] = str(v)
+              logtxt = ""
+              try:
+                  fetch(f"/code/{r['ref']}.tar.gz", r["code_sha256"], "code")
+                  for f in r.get("fetch", []):
+                      fetch(f["url"], f.get("sha256"), f["to"])
+                  if r.get("resume_url"):
+                      fetch(r["resume_url"], None, "/tmp/case")
+                      env["P2_RESUME_CASE"] = "/tmp/case/run"
+                  if r.get("kind") == "pytest":
+                      cmd, cwd = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"] + r["args"], os.path.join("code", r["dir"])
+                  elif r.get("kind") == "lab":
+                      cmd, cwd = [sys.executable, "-W", "ignore", "../.github/lab/" + r["script"]] + r["args"], "code/part5-simulation"
+                  else:
+                      cmd, cwd = [sys.executable, "-W", "ignore", "run_car.py", "--out", f"{WS}/out/r"] + r["args"], "code/part5-simulation"
+                  with open("out/r/log.txt", "w") as log:
+                      rc = subprocess.call(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+                  logtxt = open("out/r/log.txt", errors="replace").read()
+                  print(logtxt[-4000:])
+                  out["minutes"] = str(round((time.time() - t0) / 60))
+                  if r.get("kind") in ("pytest", "lab"):
+                      out["ok"] = rc == 0
+                      out["tail"] = logtxt[-6000:]
+                      out["lab_lines"] = [l for l in logtxt.splitlines() if l.startswith("LAB ")][:400]
+                      if r.get("kind") == "lab":
+                          out["log"] = logtxt[-200000:]
+                  elif os.path.exists("ckpt_path.txt"):            # saved at the time limit: continue later
+                      run = open("ckpt_path.txt").read().strip()
+                      subprocess.run(["tar", "-cf", "case.tar", "-C", os.path.dirname(run),
+                                      "--transform", f"s|^{os.path.basename(run)}|run|", os.path.basename(run)], check=True)
+                      out["checkpoint_url"] = release_file("case.tar", f"{jid}-link{int(r.get('link', 1))}.tar")
+                  else:
+                      s = json.load(open("out/r/summary.json"))
+                      out["summary"] = s
+                      wants_cfd = "--cfd" in r.get("args", [])
+                      failed_rules = s.get("legality", {}).get("summary", {}).get("failed", [])
+                      if wants_cfd and "cfd_initial" not in s and "--cfd-if-legal" in r.get("args", []) and failed_rules:
+                          out["illegal"], out["ok"] = failed_rules, rc == 0   # the referee stopped it: a real answer
+                      else:
+                          out["ok"] = rc == 0 and (bool(s.get("cfd_initial", {}).get("converged")) if wants_cfd else True)
+                      if r.get("save_case") and out["ok"]:             # keep the finished case (for warm starts)
+                          runs = sorted(glob.glob("/tmp/case/run") or glob.glob("code/part2-simulation/cfd_case_template/runs/*/"))
+                          subprocess.run(f"cd '{runs[0]}' && tar --exclude='processor*' --exclude=logs --exclude=postProcessing -cf - . | gzip > {WS}/case.tgz",
+                                         shell=True, check=True)
+                          out["case_url"] = release_file("case.tgz", f"{jid}-case.tgz")
+                          if os.path.exists("out/r/body_half.stl"):
+                              shutil.copy("out/r/body_half.stl", "body.stl")
+                              out["body_url"] = release_file("body.stl", f"{jid}-body_half.stl")
+                  if not out["ok"] and "tail" not in out:
+                      out["tail"] = logtxt[-3000:]
+              except Exception as e:
+                  out["ok"], out["error"] = False, repr(e)[:500]
+                  if os.path.exists("out/r/log.txt"):
+                      out["tail"] = open("out/r/log.txt", errors="replace").read()[-3000:]
+              if os.path.exists("out/r/body_half.stl"):
+                  out["body_sha256"] = hashlib.sha256(open("out/r/body_half.stl", "rb").read()).hexdigest()
+              fd = sorted(glob.glob("out/r/forces/forces_force.dat")) or sorted(glob.glob("out/r/**/force*.dat", recursive=True))
+              out["forces_file"] = fd[0] if fd else None
+              out["forces"] = open(fd[0]).read() if fd else ""
+              for t in range(5):
+                  try:
+                      rq = urllib.request.Request(Q + "/result", json.dumps(out).encode(), method="POST",
+                                                  headers={"Authorization": "Bearer " + identity()})
+                      print("reported", jid, urllib.request.urlopen(rq, timeout=120).status, "ok" if out["ok"] else "NOT ok")
+                      break
+                  except Exception as e:
+                      print("retry report", e)
+                      time.sleep(10)
+              return out["ok"]
+
+
+          slot, start, n = int(sys.argv[1]), int(os.environ["SLOT_START"]), 0
+          while True:
+              job = claim(slot)
+              if job is None:
+                  print(f"No job waiting. This slot ran {n} job(s).")
+                  break
+              n += 1
+              print(f"=== job {n}: {job['id']}")
+              run_one(job)
+              if time.time() - start > int(os.environ["LOOP_MINUTES"]) * 60:
+                  print(f"Slot time used up after {n} job(s).")
+                  break
           PY
-          [ -d /tmp/case/run ] && echo "P2_RESUME_CASE=/tmp/case/run" >> "$GITHUB_ENV" || true
-      - if: steps.claim.outputs.go == '1'
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - if: steps.claim.outputs.go == '1'
-        timeout-minutes: 25
+      - timeout-minutes: 25
         run: |
           (for i in 1 2 3 4 5 6; do timeout 90 sudo apt-get update -q && break; done)
           sudo apt-get install -y -q libopengl0 libglu1-mesa libegl1 libgl1 libgomp1 libxkbcommon0
           curl -s https://dl.openfoam.com/add-debian-repo.sh | sudo bash
           sudo apt-get install -y -q openfoam2412-default
           pip install $PY_DEPS
-      - if: steps.claim.outputs.go == '1'
-        id: run
-        run: |
-          start=$(date +%s)
-          export P2_CHECKPOINT_FILE=$GITHUB_WORKSPACE/ckpt_path.txt P2_FORCE_OUT=$GITHUB_WORKSPACE/out/r/forces
-          mkdir -p out/r
-          set +e
-          # the recipe's arguments go straight to the program as a list (no shell)
-          python - <<'PY' 2>&1 | tee out/r/log.txt
-          import json, os, subprocess, sys
-          r = json.load(open("job.json"))["recipe"]
-          if r.get("kind") == "pytest":                   # a code-test shard
-              rc = subprocess.call([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"] + r["args"],
-                                   cwd=os.path.join("code", r["dir"]))
-          elif r.get("kind") == "lab":                    # a lab script from the code's .github/lab
-              rc = subprocess.call([sys.executable, "-W", "ignore", "../.github/lab/" + r["script"]] + r["args"],
-                                   cwd="code/part5-simulation")
-          else:                                           # a car
-              rc = subprocess.call([sys.executable, "-W", "ignore", "run_car.py", "--out", "../../out/r"] + r["args"],
-                                   cwd="code/part5-simulation")
-          open("rc.txt", "w").write(str(rc))
-          PY
-          rc=$(cat rc.txt)
-          echo "minutes=$(( ($(date +%s) - start) / 60 ))" >> "$GITHUB_OUTPUT"
-          [ -f "$P2_CHECKPOINT_FILE" ] && { echo "checkpoint=1" >> "$GITHUB_OUTPUT"; exit 0; }
-          exit $rc
-      - if: always() && steps.claim.outputs.go == '1'
-        name: Save files and report to the queue
-        env:
-          OK: ${{ steps.run.outcome == 'success' }}
-          MIN: ${{ steps.run.outputs.minutes }}
-          CKPT: ${{ steps.run.outputs.checkpoint }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPO: ${{ github.repository }}
-        run: |
-          python3 - <<'PY'
-          import glob, hashlib, json, os, subprocess, urllib.request
-          job = json.load(open("job.json")); r = job["recipe"]; jid = job["id"]
-          def release_file(path, name):
-              """Save a big file as a public release asset of this repo; return its URL."""
-              subprocess.run(["gh", "release", "create", "queue-files", "-R", os.environ["REPO"], "--title", "Queue files",
-                              "--notes", "Saved CFD cases and checkpoints from the job queue."], capture_output=True)
-              os.rename(path, name)
-              subprocess.run(["gh", "release", "upload", "queue-files", name, "--clobber", "-R", os.environ["REPO"]], check=True)
-              return f"https://github.com/{os.environ['REPO']}/releases/download/queue-files/{name}"
-          out = {"id": jid, "ok": os.environ["OK"] == "true", "minutes": os.environ.get("MIN"),
-                 "run": os.environ["RUN_URL"], "cpu": subprocess.getoutput("lscpu | grep 'Model name' | sed 's/.*: *//'")}
-          try:
-              if r.get("kind") in ("pytest", "lab"):
-                  log = open("out/r/log.txt", errors="replace").read()
-                  out["tail"] = log[-6000:]
-                  out["lab_lines"] = [l for l in log.splitlines() if l.startswith("LAB ")][:400]
-                  if r.get("kind") == "lab":
-                      out["log"] = log[-200000:]            # labs print more than LAB lines (passes, walls)
-              elif os.environ.get("CKPT") == "1":         # solve saved at the time limit: continue later
-                  run = open(os.environ["GITHUB_WORKSPACE"] + "/ckpt_path.txt").read().strip()
-                  subprocess.run(["tar", "-cf", "case.tar", "-C", os.path.dirname(run),
-                                  "--transform", f"s|^{os.path.basename(run)}|run|", os.path.basename(run)], check=True)
-                  out["checkpoint_url"] = release_file("case.tar", f"{jid}-link{int(r.get('link', 1))}.tar")
-                  out["ok"] = False
-              else:
-                  s = json.load(open("out/r/summary.json"))
-                  out["summary"] = s
-                  wants_cfd = "--cfd" in r.get("args", [])    # build-only cars pass on a clean build
-                  failed_rules = s.get("legality", {}).get("summary", {}).get("failed", [])
-                  if wants_cfd and "cfd_initial" not in s and "--cfd-if-legal" in r.get("args", []) and failed_rules:
-                      out["illegal"] = failed_rules            # the referee stopped it: a real answer, not a failure
-                  else:
-                      out["ok"] = out["ok"] and (bool(s.get("cfd_initial", {}).get("converged")) if wants_cfd else True)
-                  if r.get("save_case"):                   # keep the finished case (for warm starts)
-                      runs = sorted(glob.glob("/tmp/case/run") or glob.glob("code/part2-simulation/cfd_case_template/runs/*/"))
-                      subprocess.run(f"cd '{runs[0]}' && tar --exclude='processor*' --exclude=logs --exclude=postProcessing -cf - . | gzip > {os.getcwd()}/case.tgz",
-                                     shell=True, check=True)
-                      out["case_url"] = release_file("case.tgz", f"{jid}-case.tgz")
-                      if os.path.exists("out/r/body_half.stl"):          # the judged body, for the next tick
-                          import shutil
-                          shutil.copy("out/r/body_half.stl", "body.stl")
-                          out["body_url"] = release_file("body.stl", f"{jid}-body_half.stl")
-          except Exception as e:
-              out["ok"], out["error"] = False, repr(e)
-          if not out["ok"] and "tail" not in out and os.path.exists("out/r/log.txt"):
-              out["tail"] = open("out/r/log.txt", errors="replace").read()[-3000:]
-          if os.path.exists("out/r/body_half.stl"):
-              out["body_sha256"] = hashlib.sha256(open("out/r/body_half.stl", "rb").read()).hexdigest()
-          fd = (sorted(glob.glob("out/r/forces/forces_force.dat")) or sorted(glob.glob("out/r/**/force*.dat", recursive=True)))
-          out["forces_file"] = fd[0] if fd else None
-          out["forces"] = open(fd[0]).read() if fd else ""
-          def identity():      # a fresh GitHub-signed token (they expire in minutes)
-              q = urllib.request.Request(os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=stem-queue",
-                                         headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-              return json.loads(urllib.request.urlopen(q, timeout=30).read())["value"]
-          for _ in range(5):
-              try:
-                  req = urllib.request.Request(os.environ["QUEUE"] + "/result", json.dumps(out).encode(), method="POST",
-                                               headers={"Authorization": "Bearer " + identity()})
-                  print("reported", urllib.request.urlopen(req, timeout=120).status); break
-              except Exception as e:
-                  print("retry", e)
-          print({k: v for k, v in out.items() if k not in ("forces", "summary", "tail")})
-          PY
+      - name: Work through jobs from the queue
+        run: python worker.py ${{ matrix.slot }}
