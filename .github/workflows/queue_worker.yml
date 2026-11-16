@@ -146,8 +146,7 @@ jobs:
                       out["ok"] = rc == 0
                       out["tail"] = logtxt[-6000:]
                       out["lab_lines"] = [l for l in logtxt.splitlines() if l.startswith("LAB ")][:400]
-                      if r.get("kind") == "lab":
-                          out["log"] = logtxt[-200000:]
+                      out["log"] = logtxt[-200000:]          # the whole test or lab output, for the parts
                   elif os.path.exists("ckpt_path.txt"):            # saved at the time limit: continue later
                       run = open("ckpt_path.txt").read().strip()
                       subprocess.run(["tar", "-cf", "case.tar", "-C", os.path.dirname(run),
