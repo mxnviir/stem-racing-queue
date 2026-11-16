@@ -215,4 +215,6 @@ jobs:
           sudo apt-get install -y -q openfoam2412-default
           pip install $PY_DEPS
       - name: Work through jobs from the queue
+        # A queued test reports its own pass/fail result; it must not fail the slot.
+        continue-on-error: true
         run: python worker.py ${{ matrix.slot }}
