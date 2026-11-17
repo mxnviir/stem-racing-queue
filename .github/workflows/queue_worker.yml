@@ -43,7 +43,64 @@ jobs:
           echo "SLOT_START=$(date +%s)" >> "$GITHUB_ENV"
           cat > worker.py <<'PY'
           """One queue slot: claim -> fetch -> run -> report, repeated (see the header of queue_worker.yml)."""
-          import glob, hashlib, json, os, shutil, subprocess, sys, time, urllib.error, urllib.request
+          import glob, hashlib, json, os, shutil, signal, subprocess, sys, threading, time, urllib.error, urllib.request
+
+          MEM_CAP_GB, DISK_MIN_GB = 12.5, 1.5        # the runner has 16 GB / 14 GB: stop the job before it takes the machine down
+
+
+          def tree_rss_gb(root):
+              """Resident memory of a process and all its children (from /proc), GB."""
+              kids, tot = {}, 0
+              if not os.path.isdir("/proc"):
+                  return 0.0
+              for d in os.listdir("/proc"):
+                  if d.isdigit():
+                      try:
+                          f = open(f"/proc/{d}/stat").read().rsplit(")", 1)[1].split()
+                          kids.setdefault(int(f[1]), []).append(int(d))
+                      except (OSError, IndexError, ValueError):
+                          pass
+              todo, seen = [root], set()
+              while todo:
+                  q = todo.pop()
+                  if q in seen:
+                      continue
+                  seen.add(q)
+                  todo += kids.get(q, [])
+                  try:
+                      for line in open(f"/proc/{q}/status"):
+                          if line.startswith("VmRSS:"):
+                              tot += int(line.split()[1])
+                  except OSError:
+                      pass
+              return tot / 2 ** 20
+
+
+          def run_guarded(cmd, cwd, env, log):
+              """Run the job at low CPU priority (the runner's own agent must keep answering GitHub) and stop
+              it cleanly if it nears the machine's memory or disk, so the reason comes back instead of a lost
+              runner. -> (return code, peak GB, why stopped or "")."""
+              nice = ["nice", "-n", "10"] if shutil.which("nice") and os.name == "posix" else []
+              p = subprocess.Popen(nice + cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=(os.name == "posix"))
+              peak, why = 0.0, []
+
+              def watch():
+                  nonlocal peak
+                  while p.poll() is None:
+                      m = tree_rss_gb(p.pid)
+                      peak = max(peak, m)
+                      free = shutil.disk_usage(os.getcwd()).free / 2 ** 30
+                      if m > MEM_CAP_GB or free < DISK_MIN_GB:
+                          why.append(f"stopped by the worker: memory {m:.1f} GB (limit {MEM_CAP_GB}), free disk {free:.1f} GB (limit {DISK_MIN_GB})")
+                          os.killpg(p.pid, signal.SIGKILL) if os.name == "posix" else p.kill()
+                          return
+                      time.sleep(5)
+              t = threading.Thread(target=watch, daemon=True)
+              t.start()
+              rc = p.wait()
+              t.join(10)
+              return rc, round(peak, 2), (why[0] if why else "")
           Q = os.environ["QUEUE"]
           WS = os.environ["GITHUB_WORKSPACE"]
 
@@ -73,22 +130,28 @@ jobs:
           def fetch(url, sha, to):
               url = url if "://" in url else Q + url
               p = os.path.join(__import__("tempfile").gettempdir(), "dl_" + hashlib.sha1(url.encode()).hexdigest())
-              for t in range(5):
+              # a connection that drops mid-file gives a short read, not an error: check the size
+              # and the sha256 inside the loop and download again (8 tries, growing waits)
+              for t in range(8):
                   try:
                       hd = {"Authorization": "Bearer " + identity()} if url.startswith(Q) else {}
+                      h, n = hashlib.sha256(), 0
                       with urllib.request.urlopen(urllib.request.Request(url, headers=hd), timeout=600) as r, open(p, "wb") as out:
+                          want = int(r.headers.get("Content-Length") or -1)
                           for chunk in iter(lambda: r.read(1 << 20), b""):
                               out.write(chunk)
+                              h.update(chunk)
+                              n += len(chunk)
+                      if want >= 0 and n != want:
+                          raise IOError(f"download cut short: {n} of {want} bytes")
+                      if sha and not h.hexdigest().startswith(sha):
+                          raise IOError(f"sha256 mismatch: {h.hexdigest()}")
                       break
                   except Exception as e:
-                      print("retry", url, e)
-                      time.sleep(10)
-              h = hashlib.sha256()
-              with open(p, "rb") as fh:
-                  for chunk in iter(lambda: fh.read(1 << 20), b""):
-                      h.update(chunk)
-              if sha and not h.hexdigest().startswith(sha):
-                  raise RuntimeError(f"sha256 mismatch for {url}: {h.hexdigest()}")
+                      print("retry", url, e, flush=True)
+                      time.sleep(min(300, 15 * 2 ** t))
+              else:
+                  raise RuntimeError(f"download failed 8 times: {url}")
               os.makedirs(to, exist_ok=True)
               subprocess.run(["unzip", "-q", "-o", p, "-d", to] if url.endswith(".zip") else ["tar", "-xf", p, "-C", to], check=True)
               os.remove(p)
@@ -138,7 +201,9 @@ jobs:
                   else:
                       cmd, cwd = [sys.executable, "-W", "ignore", "run_car.py", "--out", f"{WS}/out/r"] + r["args"], "code/part5-simulation"
                   with open("out/r/log.txt", "w") as log:
-                      rc = subprocess.call(cmd, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+                      rc, out["peak_gb"], stopped = run_guarded(cmd, cwd, env, log)
+                  if stopped:
+                      out["error"] = stopped
                   logtxt = open("out/r/log.txt", errors="replace").read()
                   print(logtxt[-4000:])
                   out["minutes"] = str(round((time.time() - t0) / 60))
@@ -163,6 +228,8 @@ jobs:
                           out["ok"] = rc == 0 and (bool(s.get("cfd_initial", {}).get("converged")) if wants_cfd else True)
                       if r.get("save_case") and out["ok"]:             # keep the finished case (for warm starts)
                           runs = sorted(glob.glob("/tmp/case/run") or glob.glob("code/part2-simulation/cfd_case_template/runs/*/"))
+                          if not runs:
+                              raise RuntimeError("save_case: no kept run folder in cfd_case_template/runs (the recipe needs --keep-runs)")
                           subprocess.run(f"cd '{runs[0]}' && tar --exclude='processor*' --exclude=logs --exclude=postProcessing -cf - . | gzip > {WS}/case.tgz",
                                          shell=True, check=True)
                           out["case_url"] = release_file("case.tgz", f"{jid}-case.tgz")
